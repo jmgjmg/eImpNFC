@@ -1,0 +1,320 @@
+/*
+
+HelloWorld: electricImp with Seeedstudio NFC shield
+====================================================
+- Author: Javier Montaner (@tumaku_ https://twitter.com/tumaku_)
+- Date: 30 Dec 2012
+
+
+
+Description
+---------------
+This code initialises SeeedStudio's NFC shield from electricImp using SPI (PINs 2/5/7 plus select PIN 1) and 
+then enters an infinite loop (repeated every X seconds) to detect when a card is presented to the NFC reader. 
+When a card is detected, its identity is read and shown in the server. 
+The code is based on a similar Arduino example.
+
+Components
+-----------
+- electricImp: https://www.sparkfun.com/products/11395
+- electricImp breakout: https://www.sparkfun.com/products/11400
+- SeeedStudio NFC shield: http://www.seeedstudio.com/depot/nfc-shield-p-916:23ce1851341ec1fa9e0c259de10bf87c.html
+- MiniUSB cable
+- Jumper Wires
+
+Connections
+------------
+Please take care to connect all the wires correctly to avoid malfunctioning
+
+    electricImp Breakout    SeeedStudio NFC Shield     Function
+     GND                     GND                        Ground
+     3V3                     5V                         Vcc (note that it is connected to the 5V PIN in the shield!!!)
+     PIN1                    PIN10                      Chip Select SPI
+     PIN2                    MISO (in ICSP connector)   MISO in SPI
+     PIN5                    SCK (in ICSP connector)    Clock in SPI
+     PIN7                    MOSI (in ICSP connector)   MOSI in SPI
+
+Additionally connect the 5V PIN in the NFC shield with the VCC PIN in the ICSP connector of the shield
+
+Finally power the electricImp breakout board through the miniUSB cable
+
+Acknowledgements
+----------------
+Many thanks to Hugo (electricImp) who has provided patient support and useful hints to integrate the SPI protocol between eImp and NFC shield
+
+License 
+--------
+Copyright 2012 Javier Montaner
+
+The PN532 library is based on the Arduino library produced by SeeedStudio which originates from a previous work of adafruit/ladyada and is licensed under the MIT license.
+
+The rest of the files and work in this project are licensed under the Creative Commons Attribution-ShareAlike 3.0 Unported License. 
+To view a copy of this license, visit http://creativecommons.org/licenses/by-sa/3.0/ or 
+send a letter to Creative Commons, 444 Castro Street, Suite 900, Mountain View, California, 94041, USA.
+
+*/
+
+const PN532_PREAMBLE= 0x00;
+const PN532_STARTCODE2= 0xFF;
+const PN532_POSTAMBLE= 0x00;
+
+const PN532_HOSTTOPN532= 0xD4;
+
+const PN532_FIRMWAREVERSION= 0x02;
+const PN532_SAMCONFIGURATION=  0x14;
+const PN532_INLISTPASSIVETARGET= 0x4A;
+const PN532_RFCONFIGURATION=       0x32;
+
+const  PN532_SPI_STATREAD= 0x02;
+const  PN532_SPI_DATAWRITE= 0x01;
+const  PN532_SPI_DATAREAD= 0x03;
+const  PN532_SPI_READY= 0x01;
+
+const PN532_MIFARE_ISO14443A= 0x0;
+const PN532_MAX_RETRIES= 0x05;
+local pn532ack = [0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00];
+local pn532response_firmwarevers = [0x00, 0xFF, 0x06, 0xFA, 0xD5, 0x03];
+
+
+local tagId="";
+local responseBuffer=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19];
+local nfcInitFlag;
+
+
+function initSPI()
+{
+    hardware.configure(SPI_257);
+    hardware.spi257.configure(LSB_FIRST |CLOCK_IDLE_HIGH, 4000); // Configure SPI_257 at about 4MHz 
+    hardware.pin1.configure(DIGITAL_OUT); //Configure the chip select pin
+    hardware.pin1.write(1);//pull CS high
+    imp.sleep(0.1);//wait 100 ms
+    hardware.pin1.write(0); //pull CS low to start the transmission of data
+    server.log("init ok");
+}
+
+function readLoop(){
+    if (nfcInitFlag) {
+    	imp.wakeup(2, readLoop); //check for the presence of cards every 2 seconds
+		local id=readNFCTag();
+		if (id!=0) server.log(format("TagId: %d", id));
+	} else server.log("PN532 could not be initialised. eImp will stop here:-(");
+}
+
+
+
+//PN532 functions
+
+function startNFC(){
+  nfcInitFlag = true;
+  hardware.pin1.write(0);//pull CS low
+  imp.sleep(1);
+  
+  // not exactly sure why but we have to send a dummy command to get synced up
+  sendCommandCheckAck([PN532_FIRMWAREVERSION], 1, 100);
+  // ignore response
+  
+  server.log("RFConfiguration")
+  // default value is 0xFF keep looking for a target card forever (this blocks the main flow/process); ultimately it times out but after a long while
+  // we use value 0x14 i.e. try only 20 times before timing out
+  sendCommandCheckAck([PN532_RFCONFIGURATION, PN532_MAX_RETRIES, 0xFF, 0x01, 0x14], 5,100);
+  // ignore response
+ 
+      				
+  if (! (getFirmwareVersion())) {
+     server.log("Didn't find PN53x board"); 
+	 nfcInitFlag = false;
+  }else {
+     if (!SAMConfig()) {
+        server.log("SAMConfig error")
+	    nfcInitFlag = false;		
+	 };
+  }
+}
+
+
+function getFirmwareVersion() {
+    server.log("Firmware Version")
+
+    if (! sendCommandCheckAck([PN532_FIRMWAREVERSION], 1,100))
+        return 0;
+    readspidata(12);
+
+    for (local i=0; i<6; i++) {
+        if (responseBuffer[i] != pn532response_firmwarevers[i]) return false; 
+    }   
+
+    server.log(format("Found chip PN5%02x", responseBuffer[6]));
+    server.log("Firmware ver "+ responseBuffer[7] + "." + responseBuffer[8]);
+    server.log(format("Supports %02x", responseBuffer[9]));
+    return true;
+}
+
+
+function SAMConfig() {
+    server.log("SAMConfig");
+    if (! sendCommandCheckAck([PN532_SAMCONFIGURATION, 0x01, 0x14, 0x01], 4, 100))
+        return false;
+
+    // read data packet
+    readspidata(8);
+    if (responseBuffer[5] == 0x15) return true;        
+    else return false;
+}
+
+
+
+
+function readNFCTag() {
+
+    server.log("readNFCTag")
+    if (! sendCommandCheckAck([PN532_INLISTPASSIVETARGET, 0x01, PN532_MIFARE_ISO14443A], 3, 100)) {
+	    server.log("Unknown error detected when trying to detect NFC cards :-(")
+        return 0x00; //No card detected
+	}
+    // read data packet
+    readspidata(20);
+    // check some basic stuff
+    
+    server.log(format("Found %1x tags.",responseBuffer[7])); 
+    if (responseBuffer[7] != 1)
+        return 0; //do not continue if number of tags != 1
+        
+    server.log(format("Sens Response: %02x%02x", responseBuffer[9],responseBuffer[10]));
+    server.log(format("Sens Response: %02x", responseBuffer[11]));
+    if ((responseBuffer[9]==0x00) && (responseBuffer[10]==0x04) && (responseBuffer[11]==0x08)) 
+            server.log("Mifare Classic");
+    if ((responseBuffer[9]==0x00) && (responseBuffer[10]==0x44) && (responseBuffer[11]==0x00))
+	   server.log("Mifare Ultralight");
+       
+    local cid=0;
+    for (local i=0; i < responseBuffer[12]; i++) {
+        cid= cid<<8;
+        cid += responseBuffer[13+i];
+    }
+    return cid;
+}
+
+function sendCommandCheckAck(cmd, cmdlen, timeout) {
+    local timer = 0;
+    // write the command
+    spiwritecommand(cmd, cmdlen);
+
+    // Wait for chip to say its ready!
+    while (readspistatus() != PN532_SPI_READY) {
+        if (timeout != 0) {
+            timer+=10;
+            if (timer > timeout){
+                server.log("No response READY");
+                return false;
+            }
+        }
+        imp.sleep(0.01);
+    }
+
+    // read acknowledgement
+    if (!spi_readack()) {
+        server.log("Wrong ACK");
+        return false;
+    }
+
+    timer = 0;
+    // Wait for chip to say its ready!
+    while (readspistatus() != PN532_SPI_READY) {
+        if (timeout != 0) {
+            timer+=10;
+            if (timer > timeout)
+                return false;
+        }
+        imp.sleep(0.01);
+    }
+
+    return true; // ack'd command
+}
+
+
+function spi_readack() {
+    readspidata(6);
+    for (local i=0; i<6; i++) {
+        if (responseBuffer[i] != pn532ack[i]) return false; 
+    }
+    return true;
+}
+
+function readspidata(length) {
+    hardware.pin1.write(0);//pull CS low
+    imp.sleep(0.002);
+    spiwrite(PN532_SPI_DATAREAD); //read leading byte DR and discard
+
+    for (local i=0; i<length; i++) {
+        imp.sleep(0.001);
+        responseBuffer[i] = spiwrite(PN532_SPI_STATREAD);
+        //server.log(responseBuffer[i]);
+    }
+    hardware.pin1.write(1);//pull CS high
+
+}
+
+function readspistatus() {
+    hardware.pin1.write(0);//pull CS low
+    imp.sleep(0.002);   
+    // Send status command to PN532; ignore returned byte
+    spiwrite(PN532_SPI_STATREAD);    
+    // Collect status response, send junk 0x00 byte
+    local value = spiwrite(0x00);    
+    hardware.pin1.write(1);//pull CS high
+    return value;
+}
+
+function spiwrite(byte) {
+    // Write the single byte
+    hardware.spi257.write(format("%c", byte));
+    // Collect the response from the holding register
+    local resp=hardware.spi257.read(1);
+    // Show what we sent
+    //server.log(format("SPI tx %02x, rx %02x", byte, resp[0]));
+    // Return the byte
+    return resp[0];
+}
+
+function spiwritecommand(cmd, cmdlen) {
+    local checksum;
+    hardware.pin1.write(0);//pull CS low
+    imp.sleep(0.002);
+    cmdlen++;
+    
+    spiwrite(PN532_SPI_DATAWRITE);
+
+    checksum = PN532_PREAMBLE + PN532_PREAMBLE + PN532_STARTCODE2;
+    spiwrite(PN532_PREAMBLE);
+    spiwrite(PN532_PREAMBLE);
+    spiwrite(PN532_STARTCODE2);
+
+    spiwrite(cmdlen);
+    local cmdlen_1=256-cmdlen;
+    spiwrite(cmdlen_1);
+
+    spiwrite(PN532_HOSTTOPN532);
+    checksum += PN532_HOSTTOPN532;
+
+    for (local i=0; i<cmdlen-1; i++) {
+        spiwrite(cmd[i]);
+        checksum += cmd[i];
+    }
+    checksum%=256;
+    local checksum_1=255-checksum;
+    spiwrite(checksum_1);
+    spiwrite(PN532_POSTAMBLE);
+    
+    hardware.pin1.write(1);//pull CS high
+
+} 
+
+
+// This is where our program actually starts! Previous stuff was all function and variable declaration.
+// This'll configure our impee. It's name is "UartCrossAir", and it has both an input and output to be connected:
+imp.configure("HelloWorld_NFC", [], []);
+initSPI(); 
+startNFC();
+readLoop(); //if all init works fine, this enters an infinite loop using imp.wakeup()
+
+// The end
